@@ -85,13 +85,23 @@ def run(
 
 
 def spawn_detached(cmd: List[str], logfile) -> subprocess.Popen:
-    """启动一个与本脚本生命周期解耦的后台进程（脚本退出后仍存活，便于复用）。"""
+    """启动一个与本脚本生命周期解耦的后台进程（脚本退出后仍存活，便于复用）。
+
+    Windows 下必须完全静默：node/ssh 等控制台程序若用 DETACHED_PROCESS 启动，
+    因脱离父控制台又无控制台可继承，反而会被系统分配一个新的控制台窗口（阻塞弹窗）。
+    改用 CREATE_NO_WINDOW（不创建任何控制台窗口）+ CREATE_NEW_PROCESS_GROUP
+    （独立进程组，父进程退出/Ctrl+C 不影响它，仍可后台存活复用），并显式隐藏窗口。
+    """
     f = open(logfile, "ab")
     kwargs = {"stdout": f, "stderr": f, "stdin": subprocess.DEVNULL}
     if IS_WIN:
         kwargs["creationflags"] = (
-            subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS
+            subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP
         )
+        si = subprocess.STARTUPINFO()
+        si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        si.wShowWindow = subprocess.SW_HIDE
+        kwargs["startupinfo"] = si
     else:
         kwargs["start_new_session"] = True
     return subprocess.Popen(cmd, **kwargs)
