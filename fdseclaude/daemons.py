@@ -9,13 +9,16 @@ from .token_manager import (
     git_commit,
     log_cred_state,
     probe_local,
+    probe_remote,
+    pull_token,
     push_token,
 )
 
 
 class TokenGuard(threading.Thread):
     """令牌守护：检测 .credentials.json 变化（每 5 秒轮询 sha256 哈希，
-    跨平台无额外依赖；哈希不同即视为变化），变化且本地有效时推送远端并 git commit。
+    跨平台无额外依赖；哈希不同即视为变化），变化且本地有效时推送远端并 git commit；
+    变化但本地失效时检查远端，若远端有效则拉取恢复（拉取条件：本地失效且远端有效）。
     """
 
     def __init__(self, http_port, stop_event, log):
@@ -46,6 +49,16 @@ class TokenGuard(threading.Thread):
                         self.log.error("[令牌守护] 推送失败，下次变化时重试")
                 else:
                     self.log.warning("[令牌守护] 本地令牌失效（疑似令牌污染），不推送")
+                    # 满足拉取条件检查：本地失效 且 远端有效 → 从远端恢复
+                    if probe_remote(self.log):
+                        if pull_token(self.log):
+                            ts = time.strftime("%Y-%m-%d %H:%M:%S")
+                            git_commit(self.log, f"OAuth token updated by remote at {ts}")
+                            log_cred_state(self.log, "[令牌守护] 已从远端恢复令牌")
+                        else:
+                            self.log.error("[令牌守护] 从远端拉取令牌失败，下次变化时重试")
+                    else:
+                        self.log.error("[令牌守护] 远端令牌同样失效，无法恢复，请在远程服务器上重新登录 claude")
                 self.baseline = cred_hash()
             except Exception:
                 self.log.exception("[令牌守护] 异常")
