@@ -98,6 +98,28 @@ def log_cred_state(log: logging.Logger, prefix: str):
     log.info("%s | hash=%s expiresAt=%s", prefix, cred_hash(), cred_expires_at())
 
 
+# 令牌临近过期的安全余量：剩余不足该秒数即视为需要刷新，避免会话期间过期
+_EXPIRY_MARGIN_SEC = 60
+
+
+def local_token_expired() -> bool:
+    """纯本地检查：令牌缺失 / 无法解析 / 已过期（或临近过期）。
+
+    仅依据 .credentials.json 的 expiresAt 字段，不发起任何网络连接，因此极快。
+    解析失败时保守视为已过期，交由远端校验兜底。
+    """
+    if not CRED_FILE.exists():
+        return True
+    try:
+        data = json.loads(CRED_FILE.read_text(encoding="utf-8"))
+        ts = (data.get("claudeAiOauth") or {}).get("expiresAt")
+    except Exception:
+        return True
+    if not isinstance(ts, (int, float)):
+        return True
+    return time.time() * 1000 >= ts - _EXPIRY_MARGIN_SEC * 1000
+
+
 # ---------------- 有效性试探 ----------------
 
 def probe_local(http_port: int, log: logging.Logger) -> bool:
@@ -165,6 +187,24 @@ def pull_token(log: logging.Logger) -> bool:
 
 
 # ---------------- 启动时同步流程（README 2.2 / 2.3） ----------------
+
+def startup_pull_from_remote(log: logging.Logger):
+    """本地令牌过期/缺失时的启动阻塞处理：连接真实远端校验并拉取。
+
+    与 startup_token_sync 不同，此处不做本地 probe（本地已判定过期），
+    直接做远端真实连接校验；远端也失效则抛 TokenError，由上层终止启动。
+    """
+    log.info("本地令牌已过期或缺失，连接远端校验并拉取（真实服务器连接）")
+    if not probe_remote(log):
+        raise TokenError(
+            "本地令牌已过期且远端 OAuth 令牌同样失效，请在远程服务器上重新登录 claude"
+        )
+    if not pull_token(log):
+        raise TokenError("无法从远程服务器下载 OAuth 令牌，脚本终止")
+    ts = time.strftime("%Y-%m-%d %H:%M:%S")
+    git_commit(log, f"OAuth token updated by remote at {ts}")
+    log_cred_state(log, "拉取远端令牌后状态")
+
 
 def startup_token_sync(http_port: int, log: logging.Logger):
     log_cred_state(log, "启动时本地令牌状态")

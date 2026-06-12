@@ -29,8 +29,10 @@ from fdseclaude.token_manager import (
     cred_hash,
     ensure_git_repo,
     git_commit,
+    local_token_expired,
     probe_local,
     push_token,
+    startup_pull_from_remote,
     startup_token_sync,
 )
 from fdseclaude.utils import IS_WIN, proxy_env, run, which_or_none
@@ -69,57 +71,70 @@ def main():
     if IS_WIN:
         register_protocol_handler(log)
 
-    # ---------- 启动时：两个任务并发 ----------
+    # ---------- 启动时：仅代理链路阻塞（claude 运行的必需前置） ----------
+    # 代理建立可能与用户交互（端口占用询问），且 claude 需要 HTTP_PROXY 才能联网，
+    # 必须在 claude 接管终端前同步完成。令牌校验则移至后台（见下）。
     proxy = ProxyPath(log)
-    proxy_ready = threading.Event()
-    errors = {}
-
-    def t_proxy():
-        try:
-            proxy.establish()
-        except ProxyPathError as e:
-            errors["proxy"] = str(e)
-        except Exception as e:
-            errors["proxy"] = repr(e)
-            log.exception("代理路径建立异常")
-        finally:
-            proxy_ready.set()
-
-    def t_token():
-        try:
-            ensure_git_repo(log)
-            proxy_ready.wait()
-            if "proxy" in errors:
-                return
-            # 本地令牌试探需要经过已建立的代理链路
-            startup_token_sync(proxy.http_port, log)
-        except TokenError as e:
-            errors["token"] = str(e)
-        except Exception as e:
-            errors["token"] = repr(e)
-            log.exception("令牌管理异常")
-
-    th1 = threading.Thread(target=t_proxy, name="ProxySetup")
-    th2 = threading.Thread(target=t_token, name="TokenSetup")
-    th1.start()
-    th2.start()
-    th1.join()
-    th2.join()
-
-    if errors:
-        for k, v in errors.items():
-            log.error("[%s] %s", k, v)
-            print(f"[fdseClaude] 启动失败: {v}", file=sys.stderr)
+    try:
+        proxy.establish()
+    except ProxyPathError as e:
+        log.error("代理路径建立失败: %s", e)
+        print(f"[fdseClaude] 启动失败: {e}", file=sys.stderr)
+        sys.exit(1)
+    except Exception as e:
+        log.exception("代理路径建立异常")
+        print(f"[fdseClaude] 启动失败: {e!r}", file=sys.stderr)
         sys.exit(1)
 
     port = proxy.http_port
 
     # ---------- 守护任务 ----------
     stop_event = threading.Event()
-    token_guard = TokenGuard(port, stop_event, log)
-    proxy_guard = ProxyGuard(proxy, stop_event, log)
-    token_guard.start()
-    proxy_guard.start()
+    guards = {}  # 持有 TokenGuard 引用，供退出清理读取 baseline
+
+    # 代理守护立即启动（代理已就绪）
+    ProxyGuard(proxy, stop_event, log).start()
+
+    # ---------- 启动时令牌处理（折中方案） ----------
+    # 1) 纯本地检查 expiresAt（不连服务器，极快）。
+    # 2) 本地过期/缺失 → 阻塞连接真实远端校验并拉取；远端也失效则终止启动
+    #    （此刻在 claude 启动前，可干净退出，避免起一个必然 401 的会话）。
+    # 3) 本地未过期 → 不阻塞，将完整同步（probe_local + 推送/拉取）转入后台，
+    #    用户输入首条 prompt 期间无感完成。
+    defer_full_sync = True
+    try:
+        ensure_git_repo(log)  # 本地操作，快
+        if local_token_expired():
+            startup_pull_from_remote(log)  # 阻塞；失败抛 TokenError
+            defer_full_sync = False  # 已持有远端有效令牌，无需后台再推送
+        else:
+            log.info("启动时本地令牌未过期，跳过阻塞校验，完整同步转入后台")
+    except TokenError as e:
+        log.error("启动令牌处理失败: %s", e)
+        print(f"[fdseClaude] 启动失败: {e}", file=sys.stderr)
+        sys.exit(1)
+    except Exception:
+        log.exception("启动令牌处理异常，转入后台尽力同步")
+
+    # 后台：完整同步（仅当本地未过期或上面异常兜底时）+ 启动令牌守护。
+    # 守护在初始同步后才构造，baseline 反映同步后状态，避免误判为变化。
+    def background_token_setup():
+        try:
+            if defer_full_sync:
+                startup_token_sync(port, log)
+        except TokenError as e:
+            log.error("[令牌后台同步] 同步失败: %s", e)
+            if NOTIFY_FLAG_FILE.exists():
+                send_notification("Claude 令牌同步失败", str(e), log)
+        except Exception:
+            log.exception("[令牌后台同步] 异常")
+        tg = TokenGuard(port, stop_event, log)
+        tg.start()
+        guards["token"] = tg
+
+    threading.Thread(
+        target=background_token_setup, name="TokenStartupSync", daemon=True
+    ).start()
 
     # ---------- 退出清理 ----------
     cleaned = threading.Event()
@@ -130,9 +145,10 @@ def main():
         cleaned.set()
         stop_event.set()
         log.info("执行退出清理 ...")
+        tg = guards.get("token")
         try:
-            # 0. 令牌变化检测 → 有效则推送
-            if cred_hash() != token_guard.baseline:
+            # 0. 令牌变化检测 → 有效则推送（守护尚未就绪则跳过，由后台同步负责）
+            if tg is not None and cred_hash() != tg.baseline:
                 log.info("退出时检测到 .credentials.json 变化，执行有效性检查")
                 if probe_local(port, log):
                     if push_token(log):
@@ -174,7 +190,7 @@ def main():
 
     env = proxy_env(port)  # 仅对本次会话（子进程）生效
     log.info("启动 Claude CLI: %s (HTTP_PROXY=http://127.0.0.1:%s)", claude_args, port)
-    print(f"[fdseClaude] 代理就绪 (127.0.0.1:{port})，正在启动 Claude CLI ...")
+    print(f"[fdseClaude] 代理就绪 (127.0.0.1:{port})，令牌将在后台校验，正在启动 Claude CLI ...")
 
     # Ctrl+C 应交给 claude 处理，父进程忽略，避免包装脚本先于 claude 退出
     old_sigint = signal.signal(signal.SIGINT, signal.SIG_IGN)
