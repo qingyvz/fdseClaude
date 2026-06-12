@@ -16,7 +16,7 @@ from fdseclaude.config import (
 )
 from fdseclaude.daemons import ProxyGuard, TokenGuard
 from fdseclaude.hooks_setup import install_hooks
-from fdseclaude.logger import setup_logger
+from fdseclaude.logger import mute_console, setup_logger, unmute_console
 from fdseclaude.machine_id import get_machine_id
 from fdseclaude.notify import (
     is_our_terminal_focused,
@@ -178,9 +178,12 @@ def main():
 
     # Ctrl+C 应交给 claude 处理，父进程忽略，避免包装脚本先于 claude 退出
     old_sigint = signal.signal(signal.SIGINT, signal.SIG_IGN)
+    # Claude CLI 接管终端期间，静默守护线程的控制台输出，避免破坏其 TUI 显示
+    mute_console(log)
     try:
         rc = subprocess.call([claude, *claude_args], env=env)
     finally:
+        unmute_console(log)
         signal.signal(signal.SIGINT, old_sigint)
 
     log.info("Claude CLI 退出，returncode=%s", rc)
